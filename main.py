@@ -2,6 +2,9 @@ import cv2
 import glob
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+import sys
+import pickle
 from moviepy.editor import VideoFileClip
 
 NUM_CHESSBOARD_COLS = 9
@@ -21,47 +24,76 @@ DST = np.float32(
          (150, 0)])
 
 def main():
+    input_video_name = sys.argv[1]
+    start_time = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    end_time = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    debug = start_time and end_time
+
     # img = cv2.imread('camera_cal/calibration5.jpg')
     img = cv2.imread('test_images/test5.jpg')
     # Compute the camera calibration matrix and distortion coefficients given a set of chessboard images.
-    chessboard_img_paths = glob.glob('camera_cal/calibration*.jpg')
-    camMatrix, distCoeffs = calc_cam_matrix(chessboard_img_paths, img.shape[:2])
-    original_clip = VideoFileClip('project_video.mp4')
-    original_clip = original_clip.cutout(5, 51)
-    lane_fitter = LaneFitter()
-    clip_with_overlays = original_clip.fl_image(
-            lambda img: process_img(img, camMatrix, distCoeffs, lane_fitter))
-    clip_with_overlays.write_videofile('output_images/project_video.mp4', audio=False)
+    camMatrix, distCoeffs = None, None
+    if os.path.exists('camera_matrix.pkl'):
+        with open('camera_matrix.pkl', 'rb') as input:
+            camMatrix, distCoeffs = pickle.load(input)
+    else:
+        chessboard_img_paths = glob.glob('camera_cal/calibration*.jpg')
+        camMatrix, distCoeffs = calc_cam_matrix(chessboard_img_paths, img.shape[:2])
 
-def process_img(img, camMatrix, distCoeffs, lane_fitter, debug_image=False):
+        with open('camera_matrix.pkl', 'wb') as output:
+            pickle.dump([camMatrix, distCoeffs], output, pickle.HIGHEST_PROTOCOL)
+
+    original_clip = VideoFileClip(input_video_name).subclip(start_time, end_time)
+    lane_fitter = LaneFitter()
+    clip_with_overlays = original_clip.fl(
+            lambda gf, t: process_img(t, gf(t), camMatrix, distCoeffs, lane_fitter, debug))
+    clip_with_overlays.write_videofile('output_images/' + input_video_name, audio=False)
+
+def process_img(tsecs, img, camMatrix, distCoeffs, lane_fitter, 
+        debug=False):
+    if debug:
+        cv2.imwrite('output_images/' + '{0:.3f}'.format(tsecs) + 'original.jpg', img)
+
     # Apply a distortion correction to raw images.
     undistorted_img = cv2.undistort(img, camMatrix, distCoeffs)
+    if debug:
+        cv2.imwrite('output_images/' + '{0:.3f}'.format(tsecs) + '_undistorted.jpg',
+                undistorted_img)
+
     # Use color transforms, gradients, etc., to create a thresholded binary image.
     binary_img, color_binary = to_binary(undistorted_img)
+    if debug:
+        write_binary_img('output_images/' + '{0:.3f}'.format(tsecs) + '_color_binary.jpg', 
+                color_binary)
+        write_binary_img('output_images/' + '{0:.3f}'.format(tsecs) + '_binary_img.jpg', 
+                binary_img)
+
 
     # Apply a perspective transform to rectify binary image ("birds-eye view").
     warped_binary_img = warp_with_perspective(binary_img)
-
-    lane_fitter.fit_next(warped_binary_img)
-    return draw_lanes(lane_fitter, warped_binary_img, undistorted_img)
+    if debug:
+        write_binary_img('output_images/' + '{0:.3f}'.format(tsecs) + '_warped_binary_img.jpg', 
+                warped_binary_img)
 
     # Detect lane pixels and fit to find the lane boundary.
     # Determine the curvature of the lane and vehicle position with respect to center.
     # Warp the detected lane boundaries back onto the original image.
     # Output visual display of the lane boundaries and numerical estimation of lane curvature and vehicle position.
-    #cv2.imwrite('output_images/original.jpg', img)
-    #cv2.imwrite('output_images/undistorted.jpg', undistorted_img)
-    #write_binary_img('output_images/color_binary.jpg', color_binary)
-    #write_binary_img('output_images/binary_img.jpg', binary_img)
-    #write_binary_img('output_images/warped_binary_img.jpg', warped_binary_img)
+    lane_fitter.fit_next(tsecs, warped_binary_img, debug)
 
-def draw_lanes(lane_fitter, binary_warped, undistort):
+    return draw_lanes(tsecs, lane_fitter, warped_binary_img, undistorted_img, debug)
+
+
+def draw_lanes(tsecs, lane_fitter, binary_warped, undistort, debug):
     # Create an image to draw the lines on
     warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
     color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
 
     left_fit = lane_fitter.best_fit('left')
     right_fit = lane_fitter.best_fit('right')
+
+    if left_fit is None or right_fit is None:
+        return undistort
 
     # Recast the x and y points into usable format for cv2.fillPoly()
     ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
@@ -79,12 +111,14 @@ def draw_lanes(lane_fitter, binary_warped, undistort):
     # Warp the blank back to original image space using inverse perspective matrix (Minv)
     newwarp = cv2.warpPerspective(color_warp, Minv, (color_warp.shape[1], color_warp.shape[0])) 
     # Combine the result with the original image
-    return cv2.addWeighted(undistort, 1, newwarp, 0.3, 0)
+    result = cv2.addWeighted(undistort, 1, newwarp, 0.3, 0)
     
-    if debug_image:
+    if debug:
         plt.clf()
         plt.imshow(result)
-        plt.savefig('output_images/lane_overlay.png')
+        plt.savefig('output_images/'+ '{0:.3f}'.format(tsecs) + '_lane_overlay.png')
+
+    return result
 
 def write_binary_img(path, img):
     scaled_img = img * 255
@@ -98,18 +132,23 @@ class LaneFitter():
     def best_fit(self, side):
         return self.recent_fits[side][0] if len(self.recent_fits[side]) else None
 
-    def fit_next(self, binary_warped, debug_image=False):
+    def fit_next(self, tsecs, binary_warped, debug=False):
         existing_fit_left = self.best_fit('left')
         existing_fit_right = self.best_fit('right')
 
 
         left_fit, right_fit = None, None
         if existing_fit_left is not None and existing_fit_right is not None:
-            left_fit, right_fit = self.fit_by_existing_fit(
-                    binary_warped, existing_fit_left, existing_fit_right)
-        # fallthrough
+            left_fit, right_fit = self.filter_fits(
+                    self.fit_by_existing_fit( tsecs, binary_warped, 
+                        existing_fit_left, existing_fit_right, debug))
+        # If existing fit doesn't give us a good resut, try with window again.
         if left_fit is None or right_fit is None:
-            left_fit, right_fit = self.fit_by_window_search(binary_warped)
+            if tsecs != 0 and debug:
+                print('{}: existing fit sucks, resorting to window'.format(tsecs))
+            left_fit, right_fit = self.filter_fits(
+                    self.fit_by_window_search(tsecs, binary_warped, debug))
+
 
         if left_fit is not None and right_fit is not None:
             if len(self.recent_fits['left']) > 10:
@@ -119,9 +158,24 @@ class LaneFitter():
             if len(self.recent_fits['right']) > 10:
                 self.recent_fits['right'].pop()
             self.recent_fits['right'].insert(0, right_fit)
+        else:
+            if debug:
+                print('{}: window search sucks, resorting to previous'.format(tsecs))
+
+    def filter_fits(self, fits):
+        left_fit, right_fit = fits
+        if self.are_sensible_fits(left_fit, right_fit):
+            return left_fit, right_fit
+        else:
+            return None, None
+
+    def are_sensible_fits(self, left_fit, right_fit):
+        left_der = np.polyder(left_fit)
+        right_der = np.polyder(right_fit)
+        return abs(np.polyval(left_der, 1000) - np.polyval(right_der, 1000)) <= 0.7
 
 
-    def fit_by_existing_fit(self, binary_warped, left_fit, right_fit, debug_image=False):
+    def fit_by_existing_fit(self, tsecs, binary_warped, left_fit, right_fit, debug=False):
         nonzero = binary_warped.nonzero()
         nonzeroy = np.array(nonzero[0])
         nonzerox = np.array(nonzero[1])
@@ -147,10 +201,9 @@ class LaneFitter():
         right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
 
         out_img = None
-        if debug_image:
+        if debug:
             # Create an output image to draw on and  visualize the result
             out_img = np.dstack((binary_warped, binary_warped, binary_warped))*255
-        if out_img:
             # Generate x and y values for plotting
             ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
             left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
@@ -159,20 +212,21 @@ class LaneFitter():
             out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
             out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
             plt.imshow(out_img)
+            plt.clf()
             plt.plot(left_fitx, ploty, color='yellow')
             plt.plot(right_fitx, ploty, color='yellow')
             plt.xlim(0, 1280)
             plt.ylim(720, 0)
-            plt.savefig('output_images/find_lines.png')
+            plt.savefig('output_images/' + '{0:.3f}'.format(tsecs) + '_find_lines_existing.png')
 
         return (left_fit, right_fit)
 
 
-    def fit_by_window_search(self, binary_warped, debug_image=False):
+    def fit_by_window_search(self, tsecs, binary_warped, debug=False):
         # Take a histogram of the bottom half of the image
         histogram = np.sum(binary_warped[int(binary_warped.shape[0]/2):,:], axis=0)
         out_img = None
-        if debug_image:
+        if debug:
             # Create an output image to draw on and  visualize the result
             out_img = np.dstack((binary_warped, binary_warped, binary_warped))*255
         # Find the peak of the left and right halves of the histogram
@@ -208,7 +262,7 @@ class LaneFitter():
             win_xright_low = rightx_current - margin
             win_xright_high = rightx_current + margin
             # Draw the windows on the visualization image
-            if out_img:
+            if debug:
                 cv2.rectangle(out_img,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high),(0,255,0), 2) 
                 cv2.rectangle(out_img,(win_xright_low,win_y_low),(win_xright_high,win_y_high),(0,255,0), 2) 
             # Identify the nonzero pixels in x and y within the window
@@ -237,7 +291,7 @@ class LaneFitter():
         left_fit = np.polyfit(lefty, leftx, 2)
         right_fit = np.polyfit(righty, rightx, 2)
 
-        if out_img:
+        if debug:
             # Generate x and y values for plotting
             ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
             left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
@@ -245,12 +299,13 @@ class LaneFitter():
 
             out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
             out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
+            plt.clf()
             plt.imshow(out_img)
             plt.plot(left_fitx, ploty, color='yellow')
             plt.plot(right_fitx, ploty, color='yellow')
             plt.xlim(0, 1280)
             plt.ylim(720, 0)
-            plt.savefig('output_images/find_lines.png')
+            plt.savefig('output_images/' + '{0:.3f}'.format(tsecs) + '_find_lines_window.png')
 
         return (left_fit, right_fit)
 
