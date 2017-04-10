@@ -27,9 +27,8 @@ def main():
     input_video_name = sys.argv[1]
     start_time = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     end_time = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    debug = start_time and end_time
+    debug = bool(end_time)
 
-    # img = cv2.imread('camera_cal/calibration5.jpg')
     img = cv2.imread('test_images/test5.jpg')
     # Compute the camera calibration matrix and distortion coefficients given a set of chessboard images.
     camMatrix, distCoeffs = None, None
@@ -51,6 +50,7 @@ def main():
 
 def process_img(tsecs, img, camMatrix, distCoeffs, lane_fitter, 
         debug=False):
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     if debug:
         cv2.imwrite('output_images/' + '{0:.3f}'.format(tsecs) + 'original.jpg', img)
 
@@ -89,11 +89,14 @@ def draw_lanes(tsecs, lane_fitter, binary_warped, undistort, debug):
     warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
     color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
 
-    left_fit = lane_fitter.best_fit('left')
-    right_fit = lane_fitter.best_fit('right')
+    left_info = lane_fitter.best_fit('left')
+    right_info = lane_fitter.best_fit('right')
 
-    if left_fit is None or right_fit is None:
+    if left_info is None or right_info is None:
         return undistort
+
+    left_fit = left_info.fit
+    right_fit = right_info.fit
 
     # Recast the x and y points into usable format for cv2.fillPoly()
     ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
@@ -113,6 +116,13 @@ def draw_lanes(tsecs, lane_fitter, binary_warped, undistort, debug):
     # Combine the result with the original image
     result = cv2.addWeighted(undistort, 1, newwarp, 0.3, 0)
     
+    cv2.putText(result, 'Curvature: {0:.4g}m'.format(
+        (left_info.curverads() + right_info.curverads()) / 2), 
+        (350, 100), cv2.FONT_HERSHEY_PLAIN, 3, 0, 5)
+    offset = center_offset(left_info, right_info, binary_warped.shape[1])
+    cv2.putText(result, 'Offset from center: {0:.4g}m'.format(offset),
+        (350, 150), cv2.FONT_HERSHEY_PLAIN, 3, 0, 5)
+    
     if debug:
         plt.clf()
         plt.imshow(result)
@@ -124,6 +134,32 @@ def write_binary_img(path, img):
     scaled_img = img * 255
     cv2.imwrite(path, scaled_img)
 
+
+class LaneInfo():
+    def __init__(self, fit, xs, ys):
+        self.fit = fit
+        self.xs = xs
+        self.ys = ys
+
+    def curverads(self):
+        ym_per_pix = 30/720 # meters per pixel in y dimension
+        xm_per_pix = 3.7/700 # meters per pixel in x dimension
+        y_eval = np.max(self.ys)
+
+        ## Fit new polynomials to x,y in world space
+        fit_cr = np.polyfit(self.ys * ym_per_pix, self.xs * xm_per_pix, 2)
+        ## Calculate the new radii of curvature
+        curverad = ((1 + (2*self.fit[0]*y_eval*ym_per_pix + self.fit[1])**2)**1.5) / np.absolute(2*self.fit[0])
+        return curverad
+
+def center_offset(left_info, right_info, total_x):
+    y_eval = max(np.max(left_info.ys), np.max(right_info.ys))
+    left_x_pos = np.polyval(left_info.fit, y_eval)
+    right_x_pos = np.polyval(right_info.fit, y_eval)
+    xm_per_pix = 3.7/700 # meters per pixel in x dimension
+    return abs((right_x_pos + left_x_pos)/2 - total_x/2) * xm_per_pix
+
+
 class LaneFitter():
     def __init__(self):
         self.recent_fits = {'left': [], 'right': []}
@@ -133,46 +169,45 @@ class LaneFitter():
         return self.recent_fits[side][0] if len(self.recent_fits[side]) else None
 
     def fit_next(self, tsecs, binary_warped, debug=False):
-        existing_fit_left = self.best_fit('left')
-        existing_fit_right = self.best_fit('right')
+        existing_left_info = self.best_fit('left')
+        existing_right_info = self.best_fit('right')
 
 
-        left_fit, right_fit = None, None
-        if existing_fit_left is not None and existing_fit_right is not None:
-            left_fit, right_fit = self.filter_fits(
-                    self.fit_by_existing_fit( tsecs, binary_warped, 
-                        existing_fit_left, existing_fit_right, debug))
+        left_info, right_info = None, None
+        if existing_left_info is not None and existing_right_info is not None:
+            left_info, right_info = self.filter_fits(
+                    self.fit_by_existing_fit(tsecs, binary_warped, 
+                        existing_left_info.fit, existing_right_info.fit, debug))
         # If existing fit doesn't give us a good resut, try with window again.
-        if left_fit is None or right_fit is None:
+        if left_info is None or right_info is None:
             if tsecs != 0 and debug:
                 print('{}: existing fit sucks, resorting to window'.format(tsecs))
-            left_fit, right_fit = self.filter_fits(
+            left_info, right_info = self.filter_fits(
                     self.fit_by_window_search(tsecs, binary_warped, debug))
 
-
-        if left_fit is not None and right_fit is not None:
+        if left_info is not None and right_info is not None:
             if len(self.recent_fits['left']) > 10:
                 self.recent_fits['left'].pop()
-            self.recent_fits['left'].insert(0, left_fit)
+            self.recent_fits['left'].insert(0, left_info)
 
             if len(self.recent_fits['right']) > 10:
                 self.recent_fits['right'].pop()
-            self.recent_fits['right'].insert(0, right_fit)
+            self.recent_fits['right'].insert(0, right_info)
         else:
             if debug:
                 print('{}: window search sucks, resorting to previous'.format(tsecs))
 
-    def filter_fits(self, fits):
-        left_fit, right_fit = fits
-        if self.are_sensible_fits(left_fit, right_fit):
-            return left_fit, right_fit
+    def filter_fits(self, left_right_info):
+        left_info, right_info = left_right_info
+        if self.are_sensible_fits(left_info.fit, right_info.fit):
+            return left_info, right_info
         else:
             return None, None
 
     def are_sensible_fits(self, left_fit, right_fit):
         left_der = np.polyder(left_fit)
         right_der = np.polyder(right_fit)
-        return abs(np.polyval(left_der, 1000) - np.polyval(right_der, 1000)) <= 0.7
+        return abs(np.polyval(left_der, 720) - np.polyval(right_der, 720)) <= 0.3
 
 
     def fit_by_existing_fit(self, tsecs, binary_warped, left_fit, right_fit, debug=False):
@@ -219,7 +254,7 @@ class LaneFitter():
             plt.ylim(720, 0)
             plt.savefig('output_images/' + '{0:.3f}'.format(tsecs) + '_find_lines_existing.png')
 
-        return (left_fit, right_fit)
+        return LaneInfo(left_fit, leftx, lefty), LaneInfo(right_fit, rightx, righty)
 
 
     def fit_by_window_search(self, tsecs, binary_warped, debug=False):
@@ -307,31 +342,7 @@ class LaneFitter():
             plt.ylim(720, 0)
             plt.savefig('output_images/' + '{0:.3f}'.format(tsecs) + '_find_lines_window.png')
 
-        return (left_fit, right_fit)
-
-
-
-
-#def calculate the radius and shit
-    # Define conversions in x and y from pixels space to meters
-    #ym_per_pix = 30/720 # meters per pixel in y dimension
-    #xm_per_pix = 3.7/700 # meters per pixel in x dimension
-    #y_eval = np.max(lefty)
-#
-    ## Fit new polynomials to x,y in world space
-    #left_fit_cr = np.polyfit(lefty*ym_per_pix, leftx*xm_per_pix, 2)
-    #right_fit_cr = np.polyfit(righty*ym_per_pix, rightx*xm_per_pix, 2)
-    ## Calculate the new radii of curvature
-    #left_curverad = ((1 + (2*left_fit_cr[0]*y_eval*ym_per_pix + left_fit_cr[1])**2)**1.5) / np.absolute(2*left_fit_cr[0])
-    #right_curverad = ((1 + (2*right_fit_cr[0]*y_eval*ym_per_pix + right_fit_cr[1])**2)**1.5) / np.absolute(2*right_fit_cr[0])
-    ## Now our radius of curvature is in meters
-    #print(left_curverad, 'm', right_curverad, 'm')
-
-
-
-def calc_center_offset(left_x, right_x, total_x):
-    xm_per_pix = 3.7/700 # meters per pixel in x dimension
-    return abs((right_x - left_x)/2 - total_x/2) * xm_per_pix
+        return LaneInfo(left_fit, leftx, lefty), LaneInfo(right_fit, rightx, righty)
 
 
 def warp_with_perspective(img):
